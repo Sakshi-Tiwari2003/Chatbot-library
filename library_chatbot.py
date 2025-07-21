@@ -1,8 +1,10 @@
 import streamlit as st
 import json
 import os
-from difflib import SequenceMatcher
-import re
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import pickle
 
 # Initialize session state
 if 'qa_pairs' not in st.session_state:
@@ -10,6 +12,15 @@ if 'qa_pairs' not in st.session_state:
 
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+
+if 'embeddings_model' not in st.session_state:
+    st.session_state.embeddings_model = None
+
+if 'question_embeddings' not in st.session_state:
+    st.session_state.question_embeddings = None
+
+if 'questions_list' not in st.session_state:
+    st.session_state.questions_list = []
 
 # Default Q&A pairs
 default_qa_pairs = {
@@ -109,8 +120,68 @@ def save_qa_pairs(qa_pairs):
 if not st.session_state.qa_pairs:
     st.session_state.qa_pairs = load_qa_pairs()
 
-# Function to find the best matching answer
-def find_best_match(user_question, qa_pairs, threshold=0.6):
+# Load or initialize the sentence transformer model
+@st.cache_resource
+def load_embeddings_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+# Load embeddings from cache or compute them
+def load_or_compute_embeddings(qa_pairs):
+    embeddings_file = 'question_embeddings.pkl'
+    
+    if os.path.exists(embeddings_file):
+        try:
+            with open(embeddings_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                if cached_data['questions'] == list(qa_pairs.keys()):
+                    return cached_data['embeddings'], cached_data['questions']
+        except:
+            pass
+    
+    # Compute embeddings
+    model = load_embeddings_model()
+    questions_list = list(qa_pairs.keys())
+    embeddings = model.encode(questions_list)
+    
+    # Cache the embeddings
+    try:
+        with open(embeddings_file, 'wb') as f:
+            pickle.dump({
+                'questions': questions_list,
+                'embeddings': embeddings
+            }, f)
+    except:
+        pass
+    
+    return embeddings, questions_list
+
+# Function to find the best matching answer using sentence embeddings
+def find_best_match_embeddings(user_question, qa_pairs, threshold=0.5):
+    if not qa_pairs:
+        return None
+    
+    # Load model and embeddings
+    model = load_embeddings_model()
+    embeddings, questions_list = load_or_compute_embeddings(qa_pairs)
+    
+    # Encode user question
+    user_embedding = model.encode([user_question])
+    
+    # Compute cosine similarities
+    similarities = cosine_similarity(user_embedding, embeddings)[0]
+    
+    # Find best match
+    best_idx = np.argmax(similarities)
+    best_score = similarities[best_idx]
+    
+    if best_score >= threshold:
+        best_question = questions_list[best_idx]
+        return qa_pairs[best_question], best_score, best_question
+    
+    return None, best_score, None
+
+# Fallback function using string matching for very short queries
+def find_best_match_fallback(user_question, qa_pairs, threshold=0.6):
     best_match = None
     best_score = 0
     
@@ -121,20 +192,32 @@ def find_best_match(user_question, qa_pairs, threshold=0.6):
         
         # Check for exact match first
         if user_question_lower == question_lower:
-            return answer
+            return answer, 1.0, question
         
-        # Check if user question contains key words from stored question
-        score = SequenceMatcher(None, user_question_lower, question_lower).ratio()
-        
-        # Also check for substring matches
+        # Check for substring matches
         if user_question_lower in question_lower or question_lower in user_question_lower:
-            score = max(score, 0.7)
-        
-        if score > best_score and score >= threshold:
-            best_score = score
-            best_match = answer
+            score = 0.8
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = answer
     
-    return best_match
+    return best_match, best_score, None
+
+# Combined matching function
+def find_best_match(user_question, qa_pairs, threshold=0.5):
+    # For very short queries, use fallback method
+    if len(user_question.strip()) < 3:
+        result, score, question = find_best_match_fallback(user_question, qa_pairs, threshold)
+        return result
+    
+    # Use embeddings for longer queries
+    try:
+        result, score, question = find_best_match_embeddings(user_question, qa_pairs, threshold)
+        return result
+    except Exception as e:
+        # Fallback to string matching if embeddings fail
+        result, score, question = find_best_match_fallback(user_question, qa_pairs, threshold)
+        return result
 
 # Default response for unknown questions
 def get_default_response():
@@ -151,6 +234,23 @@ def main():
     st.title("📚 IISER Bhopal Library Chatbot")
     st.markdown("Welcome to the IISER Bhopal Central Library chatbot! Ask me anything about library services, facilities, and policies.")
     
+    # Add info about embeddings
+    with st.expander("🔬 About This Chatbot"):
+        st.markdown("""
+        This chatbot uses **sentence embeddings** to understand your questions better:
+        - **Semantic matching**: Understands the meaning behind your questions, not just keywords
+        - **Improved accuracy**: Better matches even when you phrase questions differently
+        - **Faster responses**: Cached embeddings for quick retrieval
+        - **Smart fallback**: Uses traditional string matching for very short queries
+        """)
+    
+    # Show loading status for embeddings
+    if st.session_state.qa_pairs and st.session_state.embeddings_model is None:
+        with st.spinner("Loading AI model for better question understanding..."):
+            st.session_state.embeddings_model = load_embeddings_model()
+        st.success("✅ AI model loaded successfully!")
+        st.rerun()
+    
     # Sidebar for admin functions
     with st.sidebar:
         st.header("Admin Panel")
@@ -164,7 +264,10 @@ def main():
             if new_question and new_answer:
                 st.session_state.qa_pairs[new_question] = new_answer
                 save_qa_pairs(st.session_state.qa_pairs)
-                st.success("Q&A pair added successfully!")
+                # Clear embedding cache when new Q&A is added
+                if os.path.exists('question_embeddings.pkl'):
+                    os.remove('question_embeddings.pkl')
+                st.success("Q&A pair added successfully! Embeddings will be recomputed.")
                 st.rerun()
             else:
                 st.error("Please provide both question and answer.")
@@ -230,8 +333,31 @@ def main():
             "Is there Wi-Fi in the library?"
         ]
         
+        # Add semantic matching examples
+        st.subheader("Try These Semantic Variations")
+        semantic_questions = [
+            "What can the library do for me?",  # Similar to "What services does the library offer?"
+            "How to check out books?",  # Similar to "How do I borrow a book?"
+            "When is the library open?",  # Similar to "What are the library's hours?"
+            "Can I extend my book loan?",  # Similar to "Can I renew my books online?"
+            "How to get access to the library?",  # Similar to "How do I get a library card?"
+            "Is internet available?"  # Similar to "Is there Wi-Fi in the library?"
+        ]
+        
         for question in sample_questions:
             if st.button(question, key=f"sample_{question}"):
+                answer = find_best_match(question, st.session_state.qa_pairs)
+                if answer is None:
+                    answer = get_default_response()
+                
+                st.session_state.chat_history.append({
+                    "question": question,
+                    "answer": answer
+                })
+                st.rerun()
+        
+        for question in semantic_questions:
+            if st.button(question, key=f"semantic_{question}"):
                 answer = find_best_match(question, st.session_state.qa_pairs)
                 if answer is None:
                     answer = get_default_response()
